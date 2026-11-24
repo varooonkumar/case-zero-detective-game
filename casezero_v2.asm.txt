@@ -1,0 +1,1468 @@
+; ============================================================================
+; CASE ZERO - Detective Mystery Simulator  (version 2)
+; x86 Assembly (MASM) using the Irvine32 library
+; EL-2003 COAL Lab, FAST-NUCES Karachi
+; Group: Akshay Kumar Talreja (25K-0680), Kirpa (25K-0689)
+;
+; NEW IN VERSION 2
+;   1. Arrow-key menus (UP/DOWN or W/S, ENTER, ESC) with a highlight bar
+;      -> ArrowMenu / DrawMenu procedures (ReadKey, Gotoxy, SetTextColor)
+;   2. "Confront a suspect with evidence": a 2D table (suspect x clue)
+;      decides who reacts to what -> row*NUM_CLUES + column addressing
+;   3. Two different cases; the culprit is chosen at random each game
+;      (Randomize / RandomRange). Tables are reached through pointers
+;      (curClueTable, curConfrontTable ...) = indirect addressing
+;   4. Colour status header, typewriter text, per-suspect colours,
+;      Yes/No pop-up box before the final accusation
+;   5. Search "locations" instead of picking clue numbers
+; ============================================================================
+
+INCLUDE Irvine32.inc
+
+; ---------------------------- Constants -------------------------------------
+NUM_CLUES      = 5          ; clues per case
+NUM_SUSPECTS   = 4          ; suspects (same people in every case)
+NUM_PUZZLES    = 2          ; logic puzzles
+NUM_CASES      = 2          ; number of different cases
+NUM_PROOFS     = 5          ; confrontations that give information per case
+MIN_CLUES      = 3          ; clues needed before you may accuse someone
+MAIN_ITEMS     = 7          ; entries in the main menu
+MENU_ROW       = 5          ; screen row where every menu starts
+TYPE_DELAY     = 10         ; milliseconds between typed letters
+
+POINTS_CLUE    = 10         ; score for each NEW clue
+POINTS_SUSPECT = 5          ; score for each NEW suspect questioned
+POINTS_PROOF   = 10         ; score for each NEW useful confrontation
+POINTS_PUZZLE  = 20         ; score for a correct puzzle
+PENALTY_PUZZLE = 5          ; score lost for a wrong puzzle answer
+POINTS_SOLVED  = 30         ; bonus for the correct accusation
+GOOD_SCORE     = 120        ; final score needed for the best ending (max 190)
+
+PUZ1_ANSWER    = 15         ; answer of the numeric puzzle
+
+K_ENTER        = 0Dh        ; virtual-key codes returned by ReadKey in DX
+K_ESC          = 1Bh
+K_UP           = 26h
+K_DOWN         = 28h
+ANSWER_YES     = 6          ; MsgBoxAsk returns 6 for "Yes"
+
+.data
+; ---------------------------- Game state (arrays) ---------------------------
+clueFound      BYTE NUM_CLUES DUP(0)               ; 0 = not found, 1 = found
+suspectAsked   BYTE NUM_SUSPECTS DUP(0)            ; 0 = not questioned, 1 = questioned
+puzzleDone     BYTE NUM_PUZZLES DUP(0)             ; 0 = unsolved, 1 = solved
+confrontDone   BYTE NUM_SUSPECTS*NUM_CLUES DUP(0)  ; 2D: [suspect*NUM_CLUES + clue]
+score          DWORD 0
+inputBuf       BYTE 32 DUP(0)                      ; buffer for typed puzzle answers
+
+; ---------------------------- Current case (set by SetupCase) ---------------
+culprit          DWORD 0     ; zero-based suspect number of the thief
+curCase          DWORD 0
+curClueTable     DWORD 0     ; -> table of clue texts
+curLabelTable    DWORD 0     ; -> table of "search here" location names
+curEvidTable     DWORD 0     ; -> table of short evidence names
+curConfrontTable DWORD 0     ; -> 2D table of confrontation replies
+curSolveText     DWORD 0     ; -> text shown when the case is solved
+
+; ---------------------------- Menu engine state -----------------------------
+menuTbl        DWORD 0       ; -> table of string pointers for the open menu
+menuCnt        DWORD 0       ; number of items
+menuRow        DWORD 0       ; first screen row of the menu
+menuSel        DWORD 0       ; highlighted item
+evMenuTbl      DWORD NUM_CLUES+1 DUP(0)   ; built at run time (found / "???")
+
+; ---------------------------- Title / intro text ----------------------------
+titleBar       BYTE "=============================================",0dh,0ah
+               BYTE "            C A S E   Z E R O",0dh,0ah
+               BYTE "        Detective Mystery Simulator",0dh,0ah
+               BYTE "=============================================",0dh,0ah,0
+
+introText      BYTE 0dh,0ah
+               BYTE "BLACKWOOD MANOR - 9:00 PM",0dh,0ah,0dh,0ah
+               BYTE "During the annual charity gala, the priceless BLUE",0dh,0ah
+               BYTE "DIAMOND vanished from the locked study. The study",0dh,0ah
+               BYTE "clock stopped at exactly 9:00.",0dh,0ah,0dh,0ah
+               BYTE "Four people were in the house that night. One of",0dh,0ah
+               BYTE "them is the thief. You are the detective.",0dh,0ah,0dh,0ah
+               BYTE "RULES:",0dh,0ah
+               BYTE " - Search locations, question suspects, solve puzzles.",0dh,0ah
+               BYTE " - Show your evidence to a suspect: guilty people crack.",0dh,0ah
+               BYTE " - You need at least 3 clues before you can accuse.",0dh,0ah
+               BYTE " - A wrong accusation closes the case in failure.",0dh,0ah
+               BYTE " - The truth changes from game to game!",0dh,0ah,0dh,0ah
+               BYTE "CONTROLS: UP/DOWN (or W/S) + ENTER.  ESC = go back.",0dh,0ah,0dh,0ah,0
+
+hdrBar         BYTE " CASE ZERO  |  The Blue Diamond of Blackwood Manor        ",0
+hdrScore       BYTE " Score: ",0
+hdrClues       BYTE "   Clues: ",0
+hdrNotes       BYTE "   Statements: ",0
+hdrProofs      BYTE "   Proofs: ",0
+
+; ---------------------------- Menus -----------------------------------------
+mi1            BYTE "Search a location for clues",0
+mi2            BYTE "Question a suspect",0
+mi3            BYTE "Confront a suspect with evidence",0
+mi4            BYTE "Solve a puzzle",0
+mi5            BYTE "Review evidence & notes",0
+mi6            BYTE "Case status",0
+mi7            BYTE "Make final accusation",0
+mainMenuTbl    DWORD OFFSET mi1, OFFSET mi2, OFFSET mi3, OFFSET mi4
+               DWORD OFFSET mi5, OFFSET mi6, OFFSET mi7
+
+lblBack        BYTE "<< Back",0
+lblUnknown     BYTE "???  (evidence not found yet)",0
+
+pm1            BYTE "Puzzle 1 - The safe code",0
+pm2            BYTE "Puzzle 2 - The stopped clock",0
+puzzleMenuTbl  DWORD OFFSET pm1, OFFSET pm2, OFFSET lblBack
+
+msgPromptMain  BYTE "What will you do, detective?   (UP/DOWN + ENTER)",0
+msgPromptClue  BYTE "Where do you want to search?   (ESC = back)",0
+msgPromptSus   BYTE "Whom do you want to question?   (ESC = back)",0
+msgPromptConf1 BYTE "Whom do you want to confront?   (ESC = back)",0
+msgPromptConf2 BYTE "Which evidence do you show them?   (ESC = back)",0
+msgPromptPuz   BYTE "Choose a puzzle   (ESC = back)",0
+msgPromptAcc   BYTE "Who is the thief?   (ESC = not yet)",0
+
+; ---------------------------- Suspects (same in every case) -----------------
+sus1Name       BYTE "Mr. Hale (the butler)",0
+sus2Name       BYTE "Maria Costa (the chef)",0
+sus3Name       BYTE "Victor Lane (the gardener)",0
+sus4Name       BYTE "Clara Blackwood (the niece)",0
+
+sus1Stmt       BYTE '"I drove to the village for candles at about 8:50.',0dh,0ah
+               BYTE ' The receipt is still in my pocket."',0
+sus2Stmt       BYTE '"I was in the kitchen all night with three catering',0dh,0ah
+               BYTE ' staff. I never left my pots."',0
+sus3Stmt       BYTE '"I went home at 8 o clock. I never go near the study.',0dh,0ah
+               BYTE ' I only grow roses, detective."',0
+sus4Stmt       BYTE '"I played the piano for the guests until 9:30.',0dh,0ah
+               BYTE ' Ask anyone at the gala."',0
+
+; NOTE: the Back entry sits right after the four names, so this one table
+; can be used as a 5-item menu (names + Back) and as a 4-item name table.
+suspectNameTable DWORD OFFSET sus1Name, OFFSET sus2Name
+                 DWORD OFFSET sus3Name, OFFSET sus4Name
+                 DWORD OFFSET lblBack
+suspectStmtTable DWORD OFFSET sus1Stmt, OFFSET sus2Stmt
+                 DWORD OFFSET sus3Stmt, OFFSET sus4Stmt
+suspectColor     BYTE lightCyan, lightMagenta, lightGreen, yellow
+
+; ============================================================================
+; CASE 0 - culprit: Victor Lane (the gardener)  -> suspect index 2
+; ============================================================================
+c0L1           BYTE "The flowerbed under the study window",0
+c0L2           BYTE "The garden tool shed",0
+c0L3           BYTE "The security office",0
+c0L4           BYTE "The hall coat rack",0
+c0L5           BYTE "The study window latch",0
+c0LabelTbl     DWORD OFFSET c0L1, OFFSET c0L2, OFFSET c0L3
+               DWORD OFFSET c0L4, OFFSET c0L5, OFFSET lblBack
+
+c0E1           BYTE "Muddy boot prints",0
+c0E2           BYTE "Glass cutter",0
+c0E3           BYTE "Security log",0
+c0E4           BYTE "Hale's shop receipt",0
+c0E5           BYTE "Green glove scrap",0
+c0EvidTbl      DWORD OFFSET c0E1, OFFSET c0E2, OFFSET c0E3
+               DWORD OFFSET c0E4, OFFSET c0E5
+
+c0Clue1        BYTE "Muddy boot prints lead from the rose garden to the",0dh,0ah
+               BYTE "study window. The soil is dark, rich garden loam.",0
+c0Clue2        BYTE "A glass cutter, still smeared with soil, is hidden in",0dh,0ah
+               BYTE "the garden tool shed.",0
+c0Clue3        BYTE "Security log: the study DOOR was never opened after",0dh,0ah
+               BYTE "8:45 PM. The thief must have used the WINDOW.",0
+c0Clue4        BYTE "A shop receipt stamped 9:12 PM in the village, a",0dh,0ah
+               BYTE "20-minute drive away. It belongs to Mr. Hale.",0
+c0Clue5        BYTE "A torn scrap of green work glove, snagged with a rose",0dh,0ah
+               BYTE "thorn, is caught on the study window latch.",0
+c0ClueTbl      DWORD OFFSET c0Clue1, OFFSET c0Clue2, OFFSET c0Clue3
+               DWORD OFFSET c0Clue4, OFFSET c0Clue5
+
+c0ConfPrints   BYTE "'I walk through that garden every day,' Victor says",0dh,0ah
+               BYTE "stiffly. 'Those prints prove nothing.'",0
+c0ConfCutter   BYTE "'That cutter came from MY shed,' Victor snaps. 'Anyone",0dh,0ah
+               BYTE "could have taken it.' A bead of sweat runs down his neck.",0
+c0ConfGlove    BYTE "Victor's face drains of colour. 'That glove... it is",0dh,0ah
+               BYTE "mine. I lost it weeks ago!' He will not meet your eyes.",0
+c0ConfLogClara BYTE "Clara: 'A window? How dreadful. I could never climb",0dh,0ah
+               BYTE "anywhere - I was at the piano before twenty guests.'",0
+
+; 2D table: row = suspect (Hale, Maria, Victor, Clara), column = clue 1..5
+c0ConfTbl      DWORD 0, 0, 0, OFFSET confHaleReceipt, 0
+               DWORD 0, 0, 0, 0, 0
+               DWORD OFFSET c0ConfPrints, OFFSET c0ConfCutter, 0, 0, OFFSET c0ConfGlove
+               DWORD 0, 0, OFFSET c0ConfLogClara, 0, 0
+
+c0Solved       BYTE 0dh,0ah
+               BYTE "*** CASE SOLVED! ***",0dh,0ah
+               BYTE "Victor's glove, the cutter and the muddy prints all",0dh,0ah
+               BYTE "point to the gardener. He climbed in through the",0dh,0ah
+               BYTE "window and lied about going home. Handcuffs on!",0dh,0ah,0dh,0ah,0
+
+; ============================================================================
+; CASE 1 - culprit: Maria Costa (the chef)  -> suspect index 1
+; ============================================================================
+c1L1           BYTE "The study door lock",0
+c1L2           BYTE "The study carpet",0
+c1L3           BYTE "The kitchen key hook",0
+c1L4           BYTE "The hall coat rack",0
+c1L5           BYTE "The gate guard's desk",0
+c1LabelTbl     DWORD OFFSET c1L1, OFFSET c1L2, OFFSET c1L3
+               DWORD OFFSET c1L4, OFFSET c1L5, OFFSET lblBack
+
+c1E1           BYTE "Door log",0
+c1E2           BYTE "Flour on the carpet",0
+c1E3           BYTE "Missing master key",0
+c1E4           BYTE "Hale's shop receipt",0
+c1E5           BYTE "Gate log",0
+c1EvidTbl      DWORD OFFSET c1E1, OFFSET c1E2, OFFSET c1E3
+               DWORD OFFSET c1E4, OFFSET c1E5
+
+c1Clue1        BYTE "Security log: the study DOOR was unlocked at 8:58 PM",0dh,0ah
+               BYTE "with a master key. The window stayed latched inside.",0
+c1Clue2        BYTE "A dusting of white flour on the study carpet, leading",0dh,0ah
+               BYTE "from the service corridor to the desk.",0
+c1Clue3        BYTE "The kitchen key hook is empty. A catering assistant",0dh,0ah
+               BYTE "admits the chef stepped out 'for air' near 8:55.",0
+c1Clue4        BYTE "A shop receipt stamped 9:12 PM in the village, a",0dh,0ah
+               BYTE "20-minute drive away. It belongs to Mr. Hale.",0
+c1Clue5        BYTE "Gate log: Victor's pass was swiped OUT at 8:02 PM.",0dh,0ah
+               BYTE "Guests confirm the piano never stopped until 9:30.",0
+c1ClueTbl      DWORD OFFSET c1Clue1, OFFSET c1Clue2, OFFSET c1Clue3
+               DWORD OFFSET c1Clue4, OFFSET c1Clue5
+
+c1ConfDoor     BYTE "Maria: 'The master key? Half the staff can reach that",0dh,0ah
+               BYTE "hook,' she says, a little too quickly.",0
+c1ConfFlour    BYTE "Maria flinches and brushes flour from her apron. 'I am",0dh,0ah
+               BYTE "a chef, detective. There is flour on everything.'",0
+c1ConfKey      BYTE "'I... stepped out for a minute, that is all,' Maria",0dh,0ah
+               BYTE "stammers. 'You said you never left your pots,' you",0dh,0ah
+               BYTE "remind her. She has no answer.",0
+c1ConfGate     BYTE "Victor: 'Told you, I went home at eight. The guard saw",0dh,0ah
+               BYTE "me leave.' For once the gardener looks relieved.",0
+
+c1ConfTbl      DWORD 0, 0, 0, OFFSET confHaleReceipt, 0
+               DWORD OFFSET c1ConfDoor, OFFSET c1ConfFlour, OFFSET c1ConfKey, 0, 0
+               DWORD 0, 0, 0, 0, OFFSET c1ConfGate
+               DWORD 0, 0, 0, 0, 0
+
+c1Solved       BYTE 0dh,0ah
+               BYTE "*** CASE SOLVED! ***",0dh,0ah
+               BYTE "Maria took the master key from the hook, walked in",0dh,0ah
+               BYTE "through the study door and left a trail of flour.",0dh,0ah
+               BYTE "She lied about never leaving the kitchen. Handcuffs on!",0dh,0ah,0dh,0ah,0
+
+; shared reply (same in both cases)
+confHaleReceipt BYTE "Hale: 'Exactly as I told you, detective. Candles, in",0dh,0ah
+                BYTE "the village, at 9:12. The shopkeeper knows me well.'",0
+
+; ---------------------------- Case tables (indexed by curCase) --------------
+caseClueTbl    DWORD OFFSET c0ClueTbl,   OFFSET c1ClueTbl
+caseLabelTbl   DWORD OFFSET c0LabelTbl,  OFFSET c1LabelTbl
+caseEvidTbl    DWORD OFFSET c0EvidTbl,   OFFSET c1EvidTbl
+caseConfTbl    DWORD OFFSET c0ConfTbl,   OFFSET c1ConfTbl
+caseSolveTbl   DWORD OFFSET c0Solved,    OFFSET c1Solved
+caseCulprit    DWORD 2, 1                  ; Victor, Maria (zero-based)
+
+; ---------------------------- Puzzles ---------------------------------------
+puz1Text       BYTE 0dh,0ah
+               BYTE "PUZZLE 1 - THE SAFE CODE",0dh,0ah
+               BYTE "The study safe code is the SUM of:",0dh,0ah
+               BYTE "  - the number of windows in the study (2)",0dh,0ah
+               BYTE "  - the hour the clock stopped (9)",0dh,0ah
+               BYTE "  - the number of suspects in the house (4)",0dh,0ah
+               BYTE "Enter the code: ",0
+
+puz2Text       BYTE 0dh,0ah
+               BYTE "PUZZLE 2 - THE STOPPED CLOCK RIDDLE",0dh,0ah
+               BYTE "I have a face and two hands, but no arms or legs.",0dh,0ah
+               BYTE "What am I? (one word): ",0
+puz2Answer     BYTE "clock",0
+
+; ---------------------------- Messages --------------------------------------
+msgClueHeader  BYTE 0dh,0ah,"--- YOU SEARCH... ---",0dh,0ah,0
+msgNewClue     BYTE 0dh,0ah,"New evidence logged! (+10 points)",0dh,0ah,0
+msgOldClue     BYTE 0dh,0ah,"You already logged this clue. (no points)",0dh,0ah,0
+
+msgQuestioning BYTE 0dh,0ah,"--- Questioning: ",0
+msgDashes      BYTE " ---",0dh,0ah,0
+msgNewNote     BYTE 0dh,0ah,"Statement added to your notes. (+5 points)",0dh,0ah,0
+msgOldNote     BYTE 0dh,0ah,"You already have this statement. (no points)",0dh,0ah,0
+
+msgNoEvidence2 BYTE 0dh,0ah,"You have not found that evidence yet. Search more!",0dh,0ah,0
+msgConfHeader  BYTE 0dh,0ah,"--- You show the evidence... ---",0dh,0ah,0
+msgNoReact1    BYTE 0dh,0ah,0
+msgNoReact2    BYTE " glances at it and shrugs. Nothing new comes of it.",0dh,0ah,0
+msgNewProof    BYTE 0dh,0ah,"A reaction worth noting! (+10 points)",0dh,0ah,0
+msgOldProof    BYTE 0dh,0ah,"You already saw this reaction. (no points)",0dh,0ah,0
+
+msgPuzDone     BYTE 0dh,0ah,"You already solved that puzzle.",0dh,0ah,0
+msgPuzRight    BYTE 0dh,0ah,"Correct! Well deduced. (+20 points)",0dh,0ah,0
+msgPuzWrong    BYTE 0dh,0ah,"Wrong answer. (-5 points) You may try again.",0dh,0ah,0
+
+msgEvidenceHdr BYTE 0dh,0ah,"=========== EVIDENCE BOARD ===========",0dh,0ah,0
+msgNoEvidence  BYTE "  (no clues collected yet)",0dh,0ah,0
+msgNotesHdr    BYTE 0dh,0ah,"=========== SUSPECT NOTES ============",0dh,0ah,0
+msgNoNotes     BYTE "  (no suspects questioned yet)",0dh,0ah,0
+msgConfNotesHdr BYTE 0dh,0ah,"=========== CONFRONTATIONS ===========",0dh,0ah,0
+msgNoConf      BYTE "  (nobody has reacted to your evidence yet)",0dh,0ah,0
+msgVs          BYTE "  <-  shown: ",0
+
+msgStatusHdr   BYTE 0dh,0ah,"============= CASE STATUS ============",0dh,0ah,0
+msgStatClues   BYTE "Clues found       : ",0
+msgStatSus     BYTE "Suspects questioned: ",0
+msgStatPuz     BYTE "Puzzles solved     : ",0
+msgStatProof   BYTE "Reactions gathered : ",0
+msgStatScore   BYTE "Current score     : ",0
+msgSlash       BYTE " / ",0
+
+msgNeedMore    BYTE 0dh,0ah
+               BYTE "Insufficient evidence! Collect at least 3 clues",0dh,0ah
+               BYTE "before you accuse anyone.",0dh,0ah,0
+msgConfirmQ    BYTE "Are you sure? A wrong accusation closes the case.",0
+msgConfirmT    BYTE "Final Accusation",0
+
+msgRankMaster  BYTE "ENDING: MASTER DETECTIVE - a flawless investigation!",0dh,0ah,0
+msgRankLucky   BYTE "ENDING: LUCKY GUESS - right culprit, but you missed",0dh,0ah
+               BYTE "much of the evidence. Dig deeper next time.",0dh,0ah,0
+
+msgWrong       BYTE 0dh,0ah
+               BYTE "*** CASE FAILED ***",0dh,0ah
+               BYTE "Your accusation falls apart. The real thief slips",0dh,0ah
+               BYTE "away with the Blue Diamond.",0dh,0ah,0dh,0ah
+               BYTE "ENDING: COLD CASE",0dh,0ah,0
+
+msgReveal      BYTE "The real culprit was: ",0
+msgFinalScore  BYTE "Final score: ",0
+
+msgReplayQ     BYTE "Play again? (a new case may be waiting)",0
+msgReplayT     BYTE "Case Zero",0
+msgBye         BYTE 0dh,0ah,"Thanks for playing Case Zero. Goodbye, detective!",0dh,0ah,0
+
+.code
+; ============================================================================
+; main - game loop
+; ============================================================================
+main PROC
+    call Randomize               ; seed the random number generator once
+
+StartGame:
+    call ResetGame               ; clears state and picks a random case
+    call Clrscr
+    call ShowIntro
+
+MenuLoop:
+    call NewScreen
+    mov  edx, OFFSET msgPromptMain
+    call WriteString
+    mov  esi, OFFSET mainMenuTbl
+    mov  ecx, MAIN_ITEMS
+    mov  ebx, MENU_ROW
+    call ArrowMenu               ; EAX = 0..6, or -1 if ESC
+    cmp  eax, 0
+    je   DoClue
+    cmp  eax, 1
+    je   DoSuspect
+    cmp  eax, 2
+    je   DoConfront
+    cmp  eax, 3
+    je   DoPuzzle
+    cmp  eax, 4
+    je   DoEvidence
+    cmp  eax, 5
+    je   DoStatus
+    cmp  eax, 6
+    je   DoAccuse
+    jmp  MenuLoop                ; ESC: just redraw
+
+DoClue:
+    call InspectClue
+    jmp  AfterAction
+DoSuspect:
+    call QuestionSuspect
+    jmp  AfterAction
+DoConfront:
+    call Confront
+    jmp  AfterAction
+DoPuzzle:
+    call SolvePuzzle
+    jmp  AfterAction
+DoEvidence:
+    call ShowEvidence
+    jmp  AfterAction
+DoStatus:
+    call ShowStatus
+    jmp  AfterAction
+DoAccuse:
+    call CheckAccusation         ; EAX = 1 if the case ended, 0 otherwise
+    cmp  eax, 1
+    je   GameOver
+
+AfterAction:
+    call Crlf
+    call WaitMsg                 ; "Press any key to continue..."
+    jmp  MenuLoop
+
+GameOver:
+    mov  edx, OFFSET msgReplayQ
+    mov  ebx, OFFSET msgReplayT
+    call MsgBoxAsk               ; Yes/No pop-up window, EAX = 6 for Yes
+    cmp  eax, ANSWER_YES
+    je   StartGame
+    mov  edx, OFFSET msgBye
+    call WriteString
+    exit
+main ENDP
+
+; ============================================================================
+; SetupCase - picks a random case and points the cur... variables at its data
+; ============================================================================
+SetupCase PROC
+    push eax
+    push ebx
+
+    mov  eax, NUM_CASES
+    call RandomRange             ; EAX = 0 .. NUM_CASES-1
+    mov  curCase, eax
+    mov  ebx, eax
+
+    mov  eax, caseClueTbl[ebx*4]
+    mov  curClueTable, eax
+    mov  eax, caseLabelTbl[ebx*4]
+    mov  curLabelTable, eax
+    mov  eax, caseEvidTbl[ebx*4]
+    mov  curEvidTable, eax
+    mov  eax, caseConfTbl[ebx*4]
+    mov  curConfrontTable, eax
+    mov  eax, caseSolveTbl[ebx*4]
+    mov  curSolveText, eax
+    mov  eax, caseCulprit[ebx*4]
+    mov  culprit, eax
+
+    pop  ebx
+    pop  eax
+    ret
+SetupCase ENDP
+
+; ============================================================================
+; ResetGame - clears all arrays and the score (STOSB), then picks a new case
+; ============================================================================
+ResetGame PROC
+    push eax
+    push ecx
+    push edi
+
+    mov  score, 0
+    cld                          ; string ops go forward
+    mov  al, 0                   ; value to store
+
+    mov  edi, OFFSET clueFound
+    mov  ecx, NUM_CLUES
+    rep  stosb
+
+    mov  edi, OFFSET suspectAsked
+    mov  ecx, NUM_SUSPECTS
+    rep  stosb
+
+    mov  edi, OFFSET puzzleDone
+    mov  ecx, NUM_PUZZLES
+    rep  stosb
+
+    mov  edi, OFFSET confrontDone
+    mov  ecx, NUM_SUSPECTS*NUM_CLUES
+    rep  stosb
+
+    call SetupCase
+
+    pop  edi
+    pop  ecx
+    pop  eax
+    ret
+ResetGame ENDP
+
+; ============================================================================
+; ShowIntro - title screen and case description
+; ============================================================================
+ShowIntro PROC
+    push eax
+    push edx
+
+    mov  eax, yellow + (black * 16)
+    call SetTextColor
+    mov  edx, OFFSET titleBar
+    call WriteString
+
+    mov  eax, white + (black * 16)
+    call SetTextColor
+    mov  edx, OFFSET introText
+    call WriteString
+    call WaitMsg
+
+    pop  edx
+    pop  eax
+    ret
+ShowIntro ENDP
+
+; ============================================================================
+; NewScreen - clears the console and draws the status header (rows 0-1)
+;             the cursor is left on row 3, ready for a prompt line
+; ============================================================================
+NewScreen PROC
+    call Clrscr
+    call ShowHeader
+    ret
+NewScreen ENDP
+
+; ============================================================================
+; ShowHeader - coloured title bar + live score / progress line
+; ============================================================================
+ShowHeader PROC
+    push eax
+    push ecx
+    push edx
+    push esi
+
+    mov  dh, 0                   ; row 0, column 0
+    mov  dl, 0
+    call Gotoxy
+
+    mov  eax, yellow + (blue * 16)
+    call SetTextColor
+    mov  edx, OFFSET hdrBar
+    call WriteString
+    mov  eax, lightGray + (black * 16)
+    call SetTextColor
+    call Crlf
+
+    mov  edx, OFFSET hdrScore
+    call WriteString
+    mov  eax, score
+    call WriteDec
+
+    mov  edx, OFFSET hdrClues
+    call WriteString
+    mov  esi, OFFSET clueFound
+    mov  ecx, NUM_CLUES
+    call CountFlags
+    call WriteDec
+    mov  edx, OFFSET msgSlash
+    call WriteString
+    mov  eax, NUM_CLUES
+    call WriteDec
+
+    mov  edx, OFFSET hdrNotes
+    call WriteString
+    mov  esi, OFFSET suspectAsked
+    mov  ecx, NUM_SUSPECTS
+    call CountFlags
+    call WriteDec
+    mov  edx, OFFSET msgSlash
+    call WriteString
+    mov  eax, NUM_SUSPECTS
+    call WriteDec
+
+    mov  edx, OFFSET hdrProofs
+    call WriteString
+    mov  esi, OFFSET confrontDone
+    mov  ecx, NUM_SUSPECTS*NUM_CLUES
+    call CountFlags
+    call WriteDec
+    mov  edx, OFFSET msgSlash
+    call WriteString
+    mov  eax, NUM_PROOFS
+    call WriteDec
+
+    mov  eax, white + (black * 16)
+    call SetTextColor
+    mov  dh, 3                   ; prompt line goes on row 3
+    mov  dl, 0
+    call Gotoxy
+
+    pop  esi
+    pop  edx
+    pop  ecx
+    pop  eax
+    ret
+ShowHeader ENDP
+
+; ============================================================================
+; DrawMenu - redraws every item of the open menu; the selected one is
+;            shown with a cyan highlight bar
+; ============================================================================
+DrawMenu PROC
+    push eax
+    push ebx
+    push ecx
+    push edx
+    push esi
+
+    mov  esi, menuTbl
+    mov  ebx, 0                  ; item number
+DM_Loop:
+    mov  edx, menuRow
+    add  edx, ebx
+    mov  dh, dl                  ; DH = row  (menuRow + item)
+    mov  dl, 2                   ; DL = column
+    call Gotoxy
+
+    cmp  ebx, menuSel
+    jne  DM_Normal
+    mov  eax, black + (lightCyan * 16)
+    call SetTextColor
+    mov  al, '>'
+    call WriteChar
+    mov  al, ' '
+    call WriteChar
+    jmp  DM_Text
+DM_Normal:
+    mov  eax, white + (black * 16)
+    call SetTextColor
+    mov  al, ' '
+    call WriteChar
+    mov  al, ' '
+    call WriteChar
+DM_Text:
+    mov  edx, [esi+ebx*4]
+    call WriteString
+    inc  ebx
+    cmp  ebx, menuCnt
+    jb   DM_Loop
+
+    mov  eax, white + (black * 16)
+    call SetTextColor
+
+    pop  esi
+    pop  edx
+    pop  ecx
+    pop  ebx
+    pop  eax
+    ret
+DrawMenu ENDP
+
+; ============================================================================
+; ArrowMenu - interactive menu driven by the arrow keys
+;   IN : ESI = table of string pointers, ECX = number of items,
+;        EBX = screen row of the first item
+;   OUT: EAX = chosen item (0-based), or -1 if the player pressed ESC
+;   The cursor is left two rows below the last item.
+;   (ReadKey overwrites EBX, so all state lives in the menu... variables.)
+; ============================================================================
+ArrowMenu PROC
+    push ebx
+    push ecx
+    push edx
+    push esi
+
+    mov  menuTbl, esi
+    mov  menuCnt, ecx
+    mov  menuRow, ebx
+    mov  menuSel, 0
+
+AM_Draw:
+    call DrawMenu
+AM_Wait:
+    mov  eax, 30
+    call Delay                   ; give the keyboard queue time to fill
+    call ReadKey                 ; ZF=1 -> no key.  AL = ASCII, DX = virtual key
+    jz   AM_Wait
+
+    cmp  dx, K_UP
+    je   AM_Up
+    cmp  al, 'w'
+    je   AM_Up
+    cmp  al, 'W'
+    je   AM_Up
+    cmp  dx, K_DOWN
+    je   AM_Down
+    cmp  al, 's'
+    je   AM_Down
+    cmp  al, 'S'
+    je   AM_Down
+    cmp  dx, K_ENTER
+    je   AM_Enter
+    cmp  al, 0Dh                 ; fallback if DX is not filled in
+    je   AM_Enter
+    cmp  dx, K_ESC
+    je   AM_Esc
+    cmp  al, 1Bh
+    je   AM_Esc
+    jmp  AM_Wait
+
+AM_Up:
+    mov  eax, menuSel
+    cmp  eax, 0
+    jne  AM_UpDec
+    mov  eax, menuCnt            ; wrap from the top to the bottom
+AM_UpDec:
+    dec  eax
+    mov  menuSel, eax
+    jmp  AM_Draw
+
+AM_Down:
+    mov  eax, menuSel
+    inc  eax
+    cmp  eax, menuCnt
+    jb   AM_DownOk
+    mov  eax, 0                  ; wrap from the bottom to the top
+AM_DownOk:
+    mov  menuSel, eax
+    jmp  AM_Draw
+
+AM_Enter:
+    mov  eax, menuSel
+    jmp  AM_Finish
+AM_Esc:
+    mov  eax, -1
+
+AM_Finish:
+    mov  edx, menuRow            ; put the cursor below the menu
+    add  edx, menuCnt
+    inc  edx
+    mov  dh, dl                  ; DH = row
+    mov  dl, 0                   ; DL = column
+    call Gotoxy
+
+    pop  esi
+    pop  edx
+    pop  ecx
+    pop  ebx
+    ret
+ArrowMenu ENDP
+
+; ============================================================================
+; TypeString - prints a string one letter at a time (typewriter effect)
+;   IN : EDX = string address
+; ============================================================================
+TypeString PROC
+    push eax
+    push esi
+
+    mov  esi, edx
+TS_Loop:
+    mov  al, [esi]
+    cmp  al, 0
+    je   TS_Done
+    call WriteChar
+    cmp  BYTE PTR [esi], 0dh     ; no pause on line breaks
+    je   TS_Next
+    cmp  BYTE PTR [esi], 0ah
+    je   TS_Next
+    mov  eax, TYPE_DELAY
+    call Delay
+TS_Next:
+    inc  esi
+    jmp  TS_Loop
+TS_Done:
+    pop  esi
+    pop  eax
+    ret
+TypeString ENDP
+
+; ============================================================================
+; CountFlags - counts non-zero bytes in a byte array
+;   IN : ESI = array address, ECX = array length (must be > 0)
+;   OUT: EAX = number of non-zero entries
+; ============================================================================
+CountFlags PROC
+    push esi
+    push ecx
+    mov  eax, 0
+CF_Loop:
+    cmp  BYTE PTR [esi], 0
+    je   CF_Next
+    inc  eax
+CF_Next:
+    inc  esi
+    loop CF_Loop
+    pop  ecx
+    pop  esi
+    ret
+CountFlags ENDP
+
+; ============================================================================
+; InspectClue - choose a LOCATION to search; the clue there is logged
+; ============================================================================
+InspectClue PROC
+    push eax
+    push ebx
+    push ecx
+    push edx
+    push esi
+
+    call NewScreen
+    mov  edx, OFFSET msgPromptClue
+    call WriteString
+    mov  esi, curLabelTable      ; location names + Back
+    mov  ecx, NUM_CLUES + 1
+    mov  ebx, MENU_ROW
+    call ArrowMenu
+    cmp  eax, NUM_CLUES          ; Back (4+1) or ESC (-1, unsigned = huge)
+    jae  IC_Done
+
+    mov  ebx, eax                ; EBX = zero-based clue index
+
+    mov  edx, OFFSET msgClueHeader
+    call WriteString
+    mov  esi, curClueTable       ; indirect access to the current case
+    mov  edx, [esi+ebx*4]
+    call TypeString
+    call Crlf
+
+    cmp  clueFound[ebx], 0
+    jne  IC_Already
+    mov  clueFound[ebx], 1       ; mark as found
+    add  score, POINTS_CLUE
+    mov  edx, OFFSET msgNewClue
+    call WriteString
+    jmp  IC_Done
+IC_Already:
+    mov  edx, OFFSET msgOldClue
+    call WriteString
+
+IC_Done:
+    pop  esi
+    pop  edx
+    pop  ecx
+    pop  ebx
+    pop  eax
+    ret
+InspectClue ENDP
+
+; ============================================================================
+; QuestionSuspect - show a suspect's statement (in their colour) and note it
+; ============================================================================
+QuestionSuspect PROC
+    push eax
+    push ebx
+    push ecx
+    push edx
+    push esi
+
+    call NewScreen
+    mov  edx, OFFSET msgPromptSus
+    call WriteString
+    mov  esi, OFFSET suspectNameTable
+    mov  ecx, NUM_SUSPECTS + 1
+    mov  ebx, MENU_ROW
+    call ArrowMenu
+    cmp  eax, NUM_SUSPECTS
+    jae  QS_Done
+
+    mov  ebx, eax                ; zero-based suspect index
+
+    movzx eax, suspectColor[ebx]
+    call SetTextColor
+    mov  edx, OFFSET msgQuestioning
+    call WriteString
+    mov  edx, suspectNameTable[ebx*4]
+    call WriteString
+    mov  edx, OFFSET msgDashes
+    call WriteString
+    mov  edx, suspectStmtTable[ebx*4]
+    call TypeString
+    call Crlf
+    mov  eax, white + (black * 16)
+    call SetTextColor
+
+    cmp  suspectAsked[ebx], 0
+    jne  QS_Old
+    mov  suspectAsked[ebx], 1
+    add  score, POINTS_SUSPECT
+    mov  edx, OFFSET msgNewNote
+    call WriteString
+    jmp  QS_Done
+QS_Old:
+    mov  edx, OFFSET msgOldNote
+    call WriteString
+
+QS_Done:
+    pop  esi
+    pop  edx
+    pop  ecx
+    pop  ebx
+    pop  eax
+    ret
+QuestionSuspect ENDP
+
+; ============================================================================
+; BuildEvidenceMenu - fills evMenuTbl: evidence name if found, "???" if not,
+;                     plus the Back item at the end
+; ============================================================================
+BuildEvidenceMenu PROC
+    push eax
+    push ebx
+    push esi
+
+    mov  esi, curEvidTable
+    mov  ebx, 0
+BE_Loop:
+    cmp  clueFound[ebx], 0
+    je   BE_Unknown
+    mov  eax, [esi+ebx*4]
+    jmp  BE_Store
+BE_Unknown:
+    mov  eax, OFFSET lblUnknown
+BE_Store:
+    mov  evMenuTbl[ebx*4], eax
+    inc  ebx
+    cmp  ebx, NUM_CLUES
+    jb   BE_Loop
+    mov  evMenuTbl[ebx*4], OFFSET lblBack
+
+    pop  esi
+    pop  ebx
+    pop  eax
+    ret
+BuildEvidenceMenu ENDP
+
+; ============================================================================
+; Confront - show one piece of evidence to one suspect.
+;   The reply comes from a 2D table:  cell = suspect * NUM_CLUES + clue
+;   An empty cell (0) means "no reaction".
+; ============================================================================
+Confront PROC
+    push eax
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+
+    ; ---- step 1: choose the suspect ----
+    call NewScreen
+    mov  edx, OFFSET msgPromptConf1
+    call WriteString
+    mov  esi, OFFSET suspectNameTable
+    mov  ecx, NUM_SUSPECTS + 1
+    mov  ebx, MENU_ROW
+    call ArrowMenu
+    cmp  eax, NUM_SUSPECTS
+    jae  CF_Done
+    mov  edi, eax                ; EDI = suspect index
+
+    ; ---- step 2: choose the evidence ----
+    call BuildEvidenceMenu
+    call NewScreen
+    mov  edx, OFFSET msgPromptConf2
+    call WriteString
+    mov  esi, OFFSET evMenuTbl
+    mov  ecx, NUM_CLUES + 1
+    mov  ebx, MENU_ROW
+    call ArrowMenu
+    cmp  eax, NUM_CLUES
+    jae  CF_Done
+    mov  ecx, eax                ; ECX = clue index
+
+    cmp  clueFound[ecx], 0
+    jne  CF_Have
+    mov  edx, OFFSET msgNoEvidence2
+    call WriteString
+    jmp  CF_Done
+
+CF_Have:
+    imul ebx, edi, NUM_CLUES     ; EBX = suspect * NUM_CLUES
+    add  ebx, ecx                ; EBX = cell number in the 2D table
+    mov  esi, curConfrontTable
+    mov  edx, [esi+ebx*4]        ; reply text, or 0 = no reaction
+    cmp  edx, 0
+    jne  CF_React
+
+    ; ---- no reaction ----
+    mov  edx, OFFSET msgNoReact1
+    call WriteString
+    mov  edx, suspectNameTable[edi*4]
+    call WriteString
+    mov  edx, OFFSET msgNoReact2
+    call WriteString
+    jmp  CF_Done
+
+CF_React:
+    push edx                     ; keep the reply address
+    mov  edx, OFFSET msgConfHeader
+    call WriteString
+    movzx eax, suspectColor[edi]
+    call SetTextColor
+    pop  edx
+    call TypeString
+    call Crlf
+    mov  eax, white + (black * 16)
+    call SetTextColor
+
+    cmp  confrontDone[ebx], 0
+    jne  CF_Old
+    mov  confrontDone[ebx], 1
+    add  score, POINTS_PROOF
+    mov  edx, OFFSET msgNewProof
+    call WriteString
+    jmp  CF_Done
+CF_Old:
+    mov  edx, OFFSET msgOldProof
+    call WriteString
+
+CF_Done:
+    pop  edi
+    pop  esi
+    pop  edx
+    pop  ecx
+    pop  ebx
+    pop  eax
+    ret
+Confront ENDP
+
+; ============================================================================
+; ToLowerStr - converts a null-terminated string to lower case in place
+;   IN : ESI = string address
+; ============================================================================
+ToLowerStr PROC
+    push esi
+    push eax
+TL_Loop:
+    mov  al, [esi]
+    cmp  al, 0
+    je   TL_Done
+    cmp  al, 'A'
+    jb   TL_Next
+    cmp  al, 'Z'
+    ja   TL_Next
+    add  al, 32                  ; 'A'..'Z' -> 'a'..'z'
+    mov  [esi], al
+TL_Next:
+    inc  esi
+    jmp  TL_Loop
+TL_Done:
+    pop  eax
+    pop  esi
+    ret
+ToLowerStr ENDP
+
+; ============================================================================
+; TrimTrail - removes trailing spaces from a string
+;   IN : ESI = string address, EAX = its length (as returned by ReadString)
+; ============================================================================
+TrimTrail PROC
+    push eax
+TT_Loop:
+    cmp  eax, 0
+    je   TT_Done
+    cmp  BYTE PTR [esi+eax-1], ' '
+    jne  TT_Done
+    dec  eax
+    mov  BYTE PTR [esi+eax], 0   ; cut the string one character earlier
+    jmp  TT_Loop
+TT_Done:
+    pop  eax
+    ret
+TrimTrail ENDP
+
+; ============================================================================
+; CompareStrings - compares two null-terminated strings
+;   IN : ESI = string 1, EDI = string 2
+;   OUT: ZF = 1 if equal, ZF = 0 if different
+; ============================================================================
+CompareStrings PROC
+    push esi
+    push edi
+    push eax
+CS_Loop:
+    mov  al, [esi]
+    mov  ah, [edi]
+    cmp  al, ah
+    jne  CS_Done                 ; different  -> ZF = 0
+    cmp  al, 0
+    je   CS_Done                 ; both ended -> ZF = 1
+    inc  esi
+    inc  edi
+    jmp  CS_Loop
+CS_Done:
+    pop  eax                     ; POP does not change flags
+    pop  edi
+    pop  esi
+    ret
+CompareStrings ENDP
+
+; ============================================================================
+; SolvePuzzle - puzzle 1 (number answer), puzzle 2 (text answer)
+; ============================================================================
+SolvePuzzle PROC
+    push eax
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+
+    call NewScreen
+    mov  edx, OFFSET msgPromptPuz
+    call WriteString
+    mov  esi, OFFSET puzzleMenuTbl
+    mov  ecx, NUM_PUZZLES + 1
+    mov  ebx, MENU_ROW
+    call ArrowMenu
+    cmp  eax, NUM_PUZZLES
+    jae  SP_Done
+
+    mov  ebx, eax                ; zero-based puzzle index
+    cmp  puzzleDone[ebx], 0
+    jne  SP_AlreadyDone
+
+    cmp  ebx, 0
+    je   SP_Puzzle1
+    jmp  SP_Puzzle2
+
+SP_Puzzle1:
+    mov  edx, OFFSET puz1Text
+    call WriteString
+    call ReadInt
+    jo   SP_Wrong                ; typed something that is not a number
+    cmp  eax, PUZ1_ANSWER
+    je   SP_Correct
+    jmp  SP_Wrong
+
+SP_Puzzle2:
+    mov  edx, OFFSET puz2Text
+    call WriteString
+    mov  edx, OFFSET inputBuf
+    mov  ecx, 30                 ; max characters to read
+    call ReadString              ; EAX = number of characters typed
+    mov  esi, OFFSET inputBuf
+    call TrimTrail               ; "clock  " -> "clock"
+    call ToLowerStr              ; accept "CLOCK", "Clock", ...
+    mov  esi, OFFSET inputBuf
+    mov  edi, OFFSET puz2Answer
+    call CompareStrings          ; ZF = 1 if equal
+    je   SP_Correct
+    jmp  SP_Wrong
+
+SP_Correct:
+    mov  puzzleDone[ebx], 1
+    add  score, POINTS_PUZZLE
+    mov  edx, OFFSET msgPuzRight
+    call WriteString
+    jmp  SP_Done
+
+SP_Wrong:
+    mov  eax, score
+    sub  eax, PENALTY_PUZZLE
+    jns  SP_StoreScore           ; result not negative -> keep it
+    mov  eax, 0                  ; never let the score go below zero
+SP_StoreScore:
+    mov  score, eax
+    mov  edx, OFFSET msgPuzWrong
+    call WriteString
+    mov  al, 7                   ; bell character = beep
+    call WriteChar
+    jmp  SP_Done
+
+SP_AlreadyDone:
+    mov  edx, OFFSET msgPuzDone
+    call WriteString
+
+SP_Done:
+    pop  edi
+    pop  esi
+    pop  edx
+    pop  ecx
+    pop  ebx
+    pop  eax
+    ret
+SolvePuzzle ENDP
+
+; ============================================================================
+; ShowEvidence - clues found, suspect statements, and confrontation replies
+; ============================================================================
+ShowEvidence PROC
+    push eax
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+
+    call NewScreen
+
+    ; ---- found clues ----
+    mov  edx, OFFSET msgEvidenceHdr
+    call WriteString
+    mov  edi, curClueTable
+    mov  esi, 0                  ; index
+    mov  ebx, 0                  ; how many printed
+SE_ClueLoop:
+    cmp  clueFound[esi], 0
+    je   SE_ClueSkip
+    inc  ebx
+    mov  edx, curEvidTable
+    mov  edx, [edx+esi*4]        ; short evidence name
+    call WriteString
+    mov  al, ':'
+    call WriteChar
+    call Crlf
+    mov  edx, [edi+esi*4]        ; full clue text
+    call WriteString
+    call Crlf
+    call Crlf
+SE_ClueSkip:
+    inc  esi
+    cmp  esi, NUM_CLUES
+    jb   SE_ClueLoop
+    cmp  ebx, 0
+    jne  SE_Notes
+    mov  edx, OFFSET msgNoEvidence
+    call WriteString
+
+    ; ---- suspect statements ----
+SE_Notes:
+    mov  edx, OFFSET msgNotesHdr
+    call WriteString
+    mov  esi, 0
+    mov  ebx, 0
+SE_SusLoop:
+    cmp  suspectAsked[esi], 0
+    je   SE_SusSkip
+    inc  ebx
+    mov  edx, suspectNameTable[esi*4]
+    call WriteString
+    mov  al, ':'
+    call WriteChar
+    call Crlf
+    mov  edx, suspectStmtTable[esi*4]
+    call WriteString
+    call Crlf
+    call Crlf
+SE_SusSkip:
+    inc  esi
+    cmp  esi, NUM_SUSPECTS
+    jb   SE_SusLoop
+    cmp  ebx, 0
+    jne  SE_Conf
+    mov  edx, OFFSET msgNoNotes
+    call WriteString
+
+    ; ---- confrontations (nested loop over the 2D table) ----
+SE_Conf:
+    mov  edx, OFFSET msgConfNotesHdr
+    call WriteString
+    mov  ebx, 0                  ; how many printed
+    mov  esi, 0                  ; suspect
+SE_ConfS:
+    mov  edi, 0                  ; clue
+SE_ConfC:
+    imul eax, esi, NUM_CLUES
+    add  eax, edi                ; EAX = cell number
+    cmp  confrontDone[eax], 0
+    je   SE_ConfNext
+    inc  ebx
+    push eax                     ; remember the cell
+    mov  edx, suspectNameTable[esi*4]
+    call WriteString
+    mov  edx, OFFSET msgVs
+    call WriteString
+    mov  edx, curEvidTable
+    mov  edx, [edx+edi*4]
+    call WriteString
+    call Crlf
+    pop  eax
+    mov  edx, curConfrontTable
+    mov  edx, [edx+eax*4]
+    call WriteString
+    call Crlf
+    call Crlf
+SE_ConfNext:
+    inc  edi
+    cmp  edi, NUM_CLUES
+    jb   SE_ConfC
+    inc  esi
+    cmp  esi, NUM_SUSPECTS
+    jb   SE_ConfS
+    cmp  ebx, 0
+    jne  SE_Done
+    mov  edx, OFFSET msgNoConf
+    call WriteString
+
+SE_Done:
+    pop  edi
+    pop  esi
+    pop  edx
+    pop  ecx
+    pop  ebx
+    pop  eax
+    ret
+ShowEvidence ENDP
+
+; ============================================================================
+; ShowStatus - progress counters and current score
+; ============================================================================
+ShowStatus PROC
+    push eax
+    push ecx
+    push edx
+    push esi
+
+    call NewScreen
+    mov  edx, OFFSET msgStatusHdr
+    call WriteString
+
+    ; clues
+    mov  edx, OFFSET msgStatClues
+    call WriteString
+    mov  esi, OFFSET clueFound
+    mov  ecx, NUM_CLUES
+    call CountFlags
+    call WriteDec
+    mov  edx, OFFSET msgSlash
+    call WriteString
+    mov  eax, NUM_CLUES
+    call WriteDec
+    call Crlf
+
+    ; suspects
+    mov  edx, OFFSET msgStatSus
+    call WriteString
+    mov  esi, OFFSET suspectAsked
+    mov  ecx, NUM_SUSPECTS
+    call CountFlags
+    call WriteDec
+    mov  edx, OFFSET msgSlash
+    call WriteString
+    mov  eax, NUM_SUSPECTS
+    call WriteDec
+    call Crlf
+
+    ; puzzles
+    mov  edx, OFFSET msgStatPuz
+    call WriteString
+    mov  esi, OFFSET puzzleDone
+    mov  ecx, NUM_PUZZLES
+    call CountFlags
+    call WriteDec
+    mov  edx, OFFSET msgSlash
+    call WriteString
+    mov  eax, NUM_PUZZLES
+    call WriteDec
+    call Crlf
+
+    ; confrontations
+    mov  edx, OFFSET msgStatProof
+    call WriteString
+    mov  esi, OFFSET confrontDone
+    mov  ecx, NUM_SUSPECTS*NUM_CLUES
+    call CountFlags
+    call WriteDec
+    mov  edx, OFFSET msgSlash
+    call WriteString
+    mov  eax, NUM_PROOFS
+    call WriteDec
+    call Crlf
+
+    ; score
+    mov  edx, OFFSET msgStatScore
+    call WriteString
+    mov  eax, score
+    call WriteDec
+    call Crlf
+
+    pop  esi
+    pop  edx
+    pop  ecx
+    pop  eax
+    ret
+ShowStatus ENDP
+
+; ============================================================================
+; CheckAccusation - final accusation and ending
+;   OUT: EAX = 1 if the case ended, 0 if the player has to keep investigating
+; ============================================================================
+CheckAccusation PROC
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+
+    ; need enough evidence first
+    mov  esi, OFFSET clueFound
+    mov  ecx, NUM_CLUES
+    call CountFlags
+    cmp  eax, MIN_CLUES
+    jae  CA_Enough
+    mov  edx, OFFSET msgNeedMore
+    call WriteString
+    mov  eax, 0
+    jmp  CA_Return
+
+CA_Enough:
+    call NewScreen
+    mov  edx, OFFSET msgPromptAcc
+    call WriteString
+    mov  esi, OFFSET suspectNameTable
+    mov  ecx, NUM_SUSPECTS + 1
+    mov  ebx, MENU_ROW
+    call ArrowMenu
+    cmp  eax, NUM_SUSPECTS
+    jae  CA_Cancel
+    mov  edi, eax                ; EDI = accused suspect (zero-based)
+
+    mov  edx, OFFSET msgConfirmQ ; "Are you sure?" pop-up window
+    mov  ebx, OFFSET msgConfirmT
+    call MsgBoxAsk
+    cmp  eax, ANSWER_YES
+    jne  CA_Cancel
+
+    cmp  edi, culprit
+    jne  CA_Wrong
+
+    ; ---- correct accusation ----
+    add  score, POINTS_SOLVED
+    mov  eax, lightGreen + (black * 16)
+    call SetTextColor
+    mov  edx, curSolveText
+    call TypeString
+    cmp  score, GOOD_SCORE
+    jae  CA_Master
+    mov  edx, OFFSET msgRankLucky
+    jmp  CA_Rank
+CA_Master:
+    mov  edx, OFFSET msgRankMaster
+    jmp  CA_Rank
+
+    ; ---- wrong accusation ----
+CA_Wrong:
+    mov  eax, lightRed + (black * 16)
+    call SetTextColor
+    mov  al, 7                   ; beep
+    call WriteChar
+    mov  edx, OFFSET msgWrong
+
+CA_Rank:
+    call WriteString
+    call Crlf
+    mov  edx, OFFSET msgReveal
+    call WriteString
+    mov  ebx, culprit
+    mov  edx, suspectNameTable[ebx*4]
+    call WriteString
+    call Crlf
+    mov  edx, OFFSET msgFinalScore
+    call WriteString
+    mov  eax, score
+    call WriteDec
+    call Crlf
+    mov  eax, white + (black * 16)
+    call SetTextColor
+    mov  eax, 1
+    jmp  CA_Return
+
+CA_Cancel:
+    mov  eax, 0
+
+CA_Return:
+    pop  edi
+    pop  esi
+    pop  edx
+    pop  ecx
+    pop  ebx
+    ret
+CheckAccusation ENDP
+
+END main
